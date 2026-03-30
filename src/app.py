@@ -3,12 +3,10 @@ import pandas as pd
 import pickle
 import os
 
-# ── Configuration ─────────────────────────────────────────────────────
 MODEL_DIR    = os.path.join(os.path.dirname(__file__), '..', 'models')
 FORM_WINDOW  = 5
 STATS_WINDOW = 10
 
-# ── Load all artifacts ────────────────────────────────────────────────
 @st.cache_resource
 def load_artifacts():
     def _load(name):
@@ -35,14 +33,12 @@ def load_artifacts():
     HISTORY, BATTING_STATS, BOWLING_STATS, HOME_VENUES,
 ) = load_artifacts()
 
-
-# ── Feature computation (mirrors training logic) ─────────────────────
 def compute_features(team1, team2, venue, toss_winner, toss_decision):
     """
     Build the feature vector for a new match using REAL historical stats
     instead of hard-coded 0.5 placeholders.
     """
-    # --- encoded ids ---
+
     t1_enc = le_team.transform([team1])[0]
     t2_enc = le_team.transform([team2])[0]
     v_enc  = le_venue.transform([venue])[0]
@@ -50,9 +46,9 @@ def compute_features(team1, team2, venue, toss_winner, toss_decision):
     toss_is_t1 = 1 if toss_winner   == team1 else 0
     toss_bat   = 1 if toss_decision == 'bat' else 0
 
-    hist = HISTORY  # all past matches, sorted by date
+    hist = HISTORY  
 
-    # --- overall win rates ---
+    
     t1_all = hist[(hist['team1'] == team1) | (hist['team2'] == team1)]
     t1_wins = (t1_all['winner'] == team1).sum()
     t1_overall_wr = t1_wins / len(t1_all) if len(t1_all) else 0.5
@@ -61,15 +57,13 @@ def compute_features(team1, team2, venue, toss_winner, toss_decision):
     t2_wins = (t2_all['winner'] == team2).sum()
     t2_overall_wr = t2_wins / len(t2_all) if len(t2_all) else 0.5
 
-    # --- head-to-head (both orderings) ---
+    
     h2h = hist[
         ((hist['team1'] == team1) & (hist['team2'] == team2)) |
         ((hist['team1'] == team2) & (hist['team2'] == team1))
     ]
     h2h_t1_wins = (h2h['winner'] == team1).sum()
     h2h_wr = h2h_t1_wins / len(h2h) if len(h2h) else 0.5
-
-    # --- team1 venue win rate ---
     t1_venue = hist[
         ((hist['team1'] == team1) | (hist['team2'] == team1)) &
         (hist['venue'] == venue)
@@ -77,18 +71,15 @@ def compute_features(team1, team2, venue, toss_winner, toss_decision):
     t1_venue_wins = (t1_venue['winner'] == team1).sum()
     t1_venue_wr = t1_venue_wins / len(t1_venue) if len(t1_venue) else t1_overall_wr
 
-    # --- recent form ---
     t1_recent = t1_all.tail(FORM_WINDOW)
     t1_form = (t1_recent['winner'] == team1).sum() / len(t1_recent) if len(t1_recent) else 0.5
 
     t2_recent = t2_all.tail(FORM_WINDOW)
     t2_form = (t2_recent['winner'] == team2).sum() / len(t2_recent) if len(t2_recent) else 0.5
 
-    # --- home advantage ---
     is_home_t1 = 1 if HOME_VENUES.get(team1) == venue else 0
     is_home_t2 = 1 if HOME_VENUES.get(team2) == venue else 0
 
-    # --- deliveries-based rolling stats ---
     t1_past_ids = set(t1_all['id'])
     t2_past_ids = set(t2_all['id'])
 
@@ -112,8 +103,6 @@ def compute_features(team1, team2, venue, toss_winner, toss_decision):
     t1_avg_wkt             = _bowling_avg(team1, t1_past_ids)
     t2_avg_runs, t2_avg_rr = _batting_avg(team2, t2_past_ids)
     t2_avg_wkt             = _bowling_avg(team2, t2_past_ids)
-
-    # --- assemble feature vector (same column order as training) ---
     sample = pd.DataFrame([[
         t1_enc, t2_enc, v_enc,
         toss_is_t1, toss_bat,
@@ -141,14 +130,11 @@ def compute_features(team1, team2, venue, toss_winner, toss_decision):
 
     return sample, stats_display
 
-
-# ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(page_title='IPL Win Predictor', page_icon='🏏', layout='centered')
 st.title('🏏 IPL Win Probability Predictor')
 st.caption('Powered by XGBoost · Rolling stats · Home advantage · Recent form · IPL 2008–2024')
 st.divider()
 
-# ── Input form ────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
 with col1:
     team1 = st.selectbox('Team 1', TEAMS)
@@ -165,8 +151,7 @@ with col4:
 
 st.divider()
 
-# ── Predict ───────────────────────────────────────────────────────────
-if st.button('🎯 Predict Winner', use_container_width=True, type='primary'):
+if st.button(' Predict Winner', use_container_width=True, type='primary'):
     try:
         sample, stats = compute_features(team1, team2, venue, toss_winner, toss_decision)
 
@@ -184,10 +169,8 @@ if st.button('🎯 Predict Winner', use_container_width=True, type='primary'):
         with col_b:
             st.metric(label=team2, value=f'{t2_pct}%')
             st.progress(int(t2_pct))
-
-        # ── Key factors panel ──
         st.divider()
-        st.subheader('📊 Key Factors')
+        st.subheader('Key Factors')
 
         sc1, sc2 = st.columns(2)
         with sc1:
@@ -196,14 +179,14 @@ if st.button('🎯 Predict Winner', use_container_width=True, type='primary'):
             st.write(f"Recent Form (last {FORM_WINDOW}): {stats['team1_form']*100:.1f}%")
             st.write(f"Venue Win Rate: {stats['team1_venue_wr']*100:.1f}%")
             st.write(f"Avg Runs (last {STATS_WINDOW}): {stats['t1_avg_runs']:.1f}")
-            st.write(f"Home Advantage: {'✅ Yes' if stats['is_home_team1'] else '❌ No'}")
+            st.write(f"Home Advantage: {' Yes' if stats['is_home_team1'] else '❌ No'}")
 
         with sc2:
             st.markdown(f"**{team2}**")
             st.write(f"Overall Win Rate: {stats['team2_overall_wr']*100:.1f}%")
             st.write(f"Recent Form (last {FORM_WINDOW}): {stats['team2_form']*100:.1f}%")
             st.write(f"Avg Runs (last {STATS_WINDOW}): {stats['t2_avg_runs']:.1f}")
-            st.write(f"Home Advantage: {'✅ Yes' if stats['is_home_team2'] else '❌ No'}")
+            st.write(f"Home Advantage: {' Yes' if stats['is_home_team2'] else '❌ No'}")
 
         st.divider()
         st.caption(
