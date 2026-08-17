@@ -1,0 +1,21 @@
+{
+    "xgb": {
+        "n_estimators": 300,
+        "max_depth": 3,
+        "learning_rate": 0.011791836241342014,
+        "subsample": 0.8560360401397629,
+        "colsample_bytree": 0.8611673087158971
+    },
+    "rf": {
+        "n_estimators": 200,
+        "max_depth": 5,
+        "min_samples_split": 3
+    },
+    "mlp": {
+        "hidden_layer_sizes": [
+            128,
+            64
+        ],
+        "max_iter": 500
+    }
+}

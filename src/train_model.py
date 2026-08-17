@@ -33,6 +33,17 @@ NAME_MAP = {
     "Royal Challengers Bangalore" : "Royal Challengers Bengaluru",
 }
 
+CLIMATE_MAP = {
+    # 0: Default, 1: Dry Inland (Fast/Firm), 2: Humid Coastal (Slow/Spin), 3: Monsoon (Wear/Damp), 4: Altitude (Swing/Bounce)
+    "Narendra Modi Stadium": 1, "Sardar Patel Stadium, Motera": 1, "Rajiv Gandhi International Stadium": 1, 
+    "Ekana Cricket Stadium": 1, "Vidarbha Cricket Association Stadium": 1, "JSCA International Stadium Complex": 1,
+    "Arun Jaitley Stadium": 1, "Feroz Shah Kotla": 1, "Pune Warriors India": 1, "Maharashtra Cricket Association Stadium": 1,
+    "M. A. Chidambaram Stadium": 2, "Greenfield International Stadium": 2, "Jawaharlal Nehru Stadium": 2,
+    "Eden Gardens": 3, "Barabati Stadium": 3,
+    "Himachal Pradesh Cricket Association Stadium": 4,
+    "Wankhede Stadium": 0, "M. Chinnaswamy Stadium": 0, "Dr DY Patil Sports Academy": 0, "Brabourne Stadium": 0 # coastal/humid but excellent drainage/firm
+}
+
 print("STEP 1: Loading Data")
 raw = pd.read_csv(ARCHIVE_CSV, low_memory=False)
 for col in ["batting_team","bowling_team","match_won_by","toss_winner"]:
@@ -79,6 +90,12 @@ bowl_dict = bowl_agg.groupby("match_id").apply(lambda g: g[["bowler","bowling_te
 
 pl_bat = raw.groupby(["match_id", "batting_team"])["batter"].unique().to_dict()
 pl_bowl = raw.groupby(["match_id", "bowling_team"])["bowler"].unique().to_dict()
+
+print("STEP 2b: H2H Matchup Stats")
+h2h_agg = raw.groupby(["match_id", "batter", "bowler"]).agg(
+    runs=("batter_runs", "sum"), balls=("valid_ball", "sum"), dismissals=("bowler_wicket", "sum")
+).reset_index()
+h2h_agg = h2h_agg.merge(mid_date, on="match_id", how="left").dropna(subset=["date"])
 
 print("STEP 3: Team & Venue stats")
 batting_stats = raw.groupby(["match_id","batting_team"]).agg(runs_scored=("runs_total","sum"), balls_faced=("valid_ball","sum")).reset_index().rename(columns={"match_id":"id"})
@@ -143,16 +160,27 @@ for idx in range(len(df)):
     t1_xi_ba, t1_xi_bs, t1_xi_bw, t1_xi_be = get_xi_features(team1, t1_xi_bat, t1_xi_bowl)
     t2_xi_ba, t2_xi_bs, t2_xi_bw, t2_xi_be = get_xi_features(team2, t2_xi_bat, t2_xi_bowl)
     
+    def get_h2h_advantage(t_batters, t_bowlers, match_date):
+        past = h2h_agg[(h2h_agg["batter"].isin(t_batters)) & (h2h_agg["bowler"].isin(t_bowlers)) & (h2h_agg["date"] < match_date)]
+        if len(past) == 0: return 0.0
+        runs = past["runs"].sum(); balls = past["balls"].sum(); diss = past["dismissals"].sum()
+        return (runs / max(diss, 1)) + ((runs / max(balls, 1) * 100) / 2.0)
+        
+    t1_h2h_adv = get_h2h_advantage(t1_xi_bat, t2_xi_bowl, row["date"])
+    t2_h2h_adv = get_h2h_advantage(t2_xi_bat, t1_xi_bowl, row["date"])
+    venue_climate = CLIMATE_MAP.get(venue, 0)
+    
     features_rows.append({
         "target_score": row["target_score"], "target_wickets": row["target_wickets"], 
         "target_vs_venue_avg": row["target_score"] - venue_avg_score,
         "toss_winner_is_team1": row["toss_winner_is_team1"], "toss_decision_bat": toss_decision_bat,
-        "is_optimal_toss": is_optimal_toss, "venue_bat_wr": v_bat_wr,
+        "is_optimal_toss": is_optimal_toss, "venue_bat_wr": v_bat_wr, "venue_climate": venue_climate,
         "elo_diff": elo_diff, "team1_overall_wr": t1_wr, "team2_overall_wr": t2_wr,
         "team1_venue_wr": t1_venue_wr, "team1_form": t1_form, "team2_form": t2_form,
         "is_home_team1": is_home_t1, "venue_avg_score": venue_avg_score,
         "t1_xi_bat_avg": t1_xi_ba, "t1_xi_bat_sr": t1_xi_bs, "t1_xi_bowl_wkt": t1_xi_bw, "t1_xi_bowl_econ": t1_xi_be,
         "t2_xi_bat_avg": t2_xi_ba, "t2_xi_bat_sr": t2_xi_bs, "t2_xi_bowl_wkt": t2_xi_bw, "t2_xi_bowl_econ": t2_xi_be,
+        "t1_h2h_adv": t1_h2h_adv, "t2_h2h_adv": t2_h2h_adv,
     })
     
     outcome = row["team1_won"]
@@ -176,9 +204,9 @@ for idx in range(len(df)):
 features_df = pd.DataFrame(features_rows).fillna(0)
 for col in features_df.columns: df[col] = features_df[col].values
 
-INPLAY_FEATURES = ['target_score', 'target_wickets', 'target_vs_venue_avg', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score', 'is_optimal_toss', 'venue_bat_wr']
+INPLAY_FEATURES = ['target_score', 'target_wickets', 'target_vs_venue_avg', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score', 'is_optimal_toss', 'venue_bat_wr', 'venue_climate', 't1_h2h_adv', 't2_h2h_adv']
 
-PREMATCH_FEATURES = ['toss_winner_is_team1', 'toss_decision_bat', 'is_optimal_toss', 'venue_bat_wr', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score']
+PREMATCH_FEATURES = ['toss_winner_is_team1', 'toss_decision_bat', 'is_optimal_toss', 'venue_bat_wr', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score', 'venue_climate', 't1_h2h_adv', 't2_h2h_adv']
 
 y = df["team1_won"]
 train_mask = df["date"].dt.year < 2023; test_mask = df["date"].dt.year >= 2023
@@ -186,9 +214,18 @@ y_train, y_test = y[train_mask], y[test_mask]
 pos_w = float((y_train==0).sum()) / float((y_train==1).sum())
 
 def build_stacking_model(X_tr, X_te):
-    xgb = XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.05, scale_pos_weight=pos_w, random_state=42)
-    rf = RandomForestClassifier(n_estimators=300, max_depth=8, class_weight="balanced", random_state=42)
-    mlp = Pipeline([("sc", StandardScaler()), ("mlp", MLPClassifier(hidden_layer_sizes=(128,64), max_iter=500, random_state=42, early_stopping=True))])
+    import json
+    # Use best params if available
+    best = {"xgb": {}, "rf": {}, "mlp": {}}
+    if os.path.exists(os.path.join(MODEL_DIR, "best_params.json")):
+        with open(os.path.join(MODEL_DIR, "best_params.json")) as f:
+            best = json.load(f)
+            print("Loaded optimized hyperparameters from Optuna!")
+            
+    xgb = XGBClassifier(**best.get("xgb", {}), scale_pos_weight=pos_w, random_state=42)
+    rf = RandomForestClassifier(**best.get("rf", {}), class_weight="balanced", random_state=42)
+    mlp = Pipeline([("sc", StandardScaler()), ("mlp", MLPClassifier(**best.get("mlp", {}), random_state=42, early_stopping=True))])
+    
     stack = StackingClassifier(estimators=[("xgb",xgb), ("rf",rf), ("mlp",mlp)], final_estimator=LogisticRegression(class_weight="balanced"), cv=5, n_jobs=-1)
     stack.fit(X_tr, y_train)
     return stack, accuracy_score(y_test, stack.predict(X_te))
