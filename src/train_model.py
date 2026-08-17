@@ -1,426 +1,234 @@
-import pandas as pd
+﻿import pandas as pd
 import numpy as np
 import pickle
 import os
-import time
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
-BASE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-DATA_DIR   = os.path.join(BASE_DIR, 'data')
-MODEL_DIR  = os.path.join(BASE_DIR, 'models')
 
-FORM_WINDOW  = 5   
-STATS_WINDOW = 10   
-RANDOM_STATE = 42
-print("=" * 60)
-print("STEP 1: Loading data")
-print("=" * 60)
-matches    = pd.read_csv(os.path.join(DATA_DIR, 'matches.csv'))
-deliveries = pd.read_csv(os.path.join(DATA_DIR, 'deliveries.csv'))
-print(f"  Matches shape   : {matches.shape}")
-print(f"  Deliveries shape: {deliveries.shape}")
-print("\n" + "=" * 60)
-print("STEP 2: Cleaning team names")
-print("=" * 60)
+BASE_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+MODEL_DIR   = os.path.join(BASE_DIR, "models")
+ARCHIVE_CSV = r"C:\mydesk\archive\IPL.csv"
 
-name_map = {
-    'Delhi Daredevils'             : 'Delhi Capitals',
-    'Kings XI Punjab'              : 'Punjab Kings',
-    'Deccan Chargers'              : 'Sunrisers Hyderabad',
-    'Rising Pune Supergiants'      : 'Rising Pune Supergiant',
-    'Pune Warriors'                : 'Pune Warriors India',
-    'Royal Challengers Bangalore'  : 'Royal Challengers Bengaluru',
+FORM_WINDOW   = 5
+PLAYER_WINDOW = 10
+RANDOM_STATE  = 42
+ELO_K         = 32
+ELO_INIT      = 1500
+
+NAME_MAP = {
+    "Delhi Daredevils"            : "Delhi Capitals",
+    "Kings XI Punjab"             : "Punjab Kings",
+    "Deccan Chargers"             : "Sunrisers Hyderabad",
+    "Rising Pune Supergiants"     : "Rising Pune Supergiant",
+    "Pune Warriors"               : "Pune Warriors India",
+    "Royal Challengers Bangalore" : "Royal Challengers Bengaluru",
 }
 
-for col in ['team1', 'team2', 'winner', 'toss_winner']:
-    if col in matches.columns:
-        matches[col] = matches[col].replace(name_map)
+print("STEP 1: Loading Data")
+raw = pd.read_csv(ARCHIVE_CSV, low_memory=False)
+for col in ["batting_team","bowling_team","match_won_by","toss_winner"]:
+    if col in raw.columns: raw[col] = raw[col].replace(NAME_MAP)
 
-for col in ['batting_team', 'bowling_team']:
-    if col in deliveries.columns:
-        deliveries[col] = deliveries[col].replace(name_map)
-df = matches.dropna(subset=['winner']).copy()
-if 'result' in df.columns:
-    df = df[df['result'] != 'tie'].copy()
+first_balls = raw[raw["innings"] == 1].groupby("match_id").first().reset_index()
+match_df = first_balls[["match_id","date","batting_team","bowling_team",
+                         "match_won_by","toss_winner","toss_decision",
+                         "venue","season","result_type","win_outcome"]].copy()
+match_df = match_df.rename(columns={"batting_team":"team1","bowling_team":"team2","match_won_by":"winner","match_id":"id"})
+match_df = match_df[match_df["result_type"].isna()].dropna(subset=["winner"]).copy()
+match_df["date"] = pd.to_datetime(match_df["date"], format="mixed", dayfirst=True)
+match_df = match_df.sort_values("date").reset_index(drop=True)
+match_df["team1_won"] = (match_df["winner"] == match_df["team1"]).astype(int)
+match_df["toss_winner_is_team1"] = (match_df["toss_winner"] == match_df["team1"]).astype(int)
+match_df["toss_decision_bat"] = (match_df["toss_decision"] == "bat").astype(int)
 
-df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values('date').reset_index(drop=True)
+innings1 = raw[raw["innings"] == 1]
+i1_stats = innings1.groupby("match_id").agg(target_score=("runs_total", "sum"), target_wickets=("striker_out", "sum")).reset_index().rename(columns={"match_id": "id"})
+match_df = match_df.merge(i1_stats, on="id", how="left").fillna(0)
+mid_date = match_df[["id","date"]].rename(columns={"id":"match_id"})
 
-df['team1_won']            = (df['winner']      == df['team1']).astype(int)
-df['toss_winner_is_team1'] = (df['toss_winner'] == df['team1']).astype(int)
-df['toss_decision_bat']    = (df['toss_decision'] == 'bat').astype(int)
-
-print(f"  Usable matches: {len(df)}")
-print(f"  Date range    : {df['date'].min().date()} to {df['date'].max().date()}")
-print(f"  Unique teams  : {sorted(df['team1'].unique())}")
-print("\n" + "=" * 60)
-print("STEP 3: Aggregating deliveries to match-level stats")
-print("=" * 60)
-
-batting_stats = deliveries.groupby(['match_id', 'batting_team']).agg(
-    runs_scored = ('total_runs', 'sum'),
-    balls_faced = ('ball', 'count'),
-    fours       = ('batsman_runs', lambda x: (x == 4).sum()),
-    sixes       = ('batsman_runs', lambda x: (x == 6).sum()),
+print("STEP 2: Player stats")
+bat_agg = raw.groupby(["match_id","batter"]).agg(
+    batting_team=("batting_team","first"), batter_runs=("batter_runs","sum"), batter_balls=("batter_balls","sum")
 ).reset_index()
+bat_agg["batter_sr"] = bat_agg["batter_runs"] / bat_agg["batter_balls"].clip(lower=1) * 100
+bat_agg = bat_agg.merge(mid_date, on="match_id", how="left").dropna(subset=["date"]).sort_values(["batter","date"]).reset_index(drop=True)
 
-batting_stats['overs_faced'] = batting_stats['balls_faced'] / 6.0
-batting_stats['run_rate']    = batting_stats['runs_scored'] / batting_stats['overs_faced'].clip(lower=0.1)
-bowling_stats = deliveries.groupby(['match_id', 'bowling_team']).agg(
-    wickets_taken = ('is_wicket', 'sum'),
+bowl_agg = raw.groupby(["match_id","bowler"]).agg(
+    bowling_team=("bowling_team","first"), bowler_wickets=("bowler_wicket","sum"),
+    bowler_runs_conc=("runs_bowler","sum"), bowler_balls=("valid_ball","sum")
 ).reset_index()
+bowl_agg["bowler_economy"] = bowl_agg["bowler_runs_conc"] / (bowl_agg["bowler_balls"].clip(lower=1)/6)
+bowl_agg = bowl_agg.merge(mid_date, on="match_id", how="left").dropna(subset=["date"]).sort_values(["bowler","date"]).reset_index(drop=True)
 
-match_dates = df[['id', 'date']].rename(columns={'id': 'match_id'})
-batting_stats = batting_stats.merge(match_dates, on='match_id', how='left').sort_values('date').reset_index(drop=True)
-bowling_stats = bowling_stats.merge(match_dates, on='match_id', how='left').sort_values('date').reset_index(drop=True)
+bat_agg["rolling_avg_runs"] = bat_agg.groupby("batter")["batter_runs"].transform(lambda x: x.shift(1).rolling(PLAYER_WINDOW, min_periods=1).mean())
+bat_agg["rolling_avg_sr"]   = bat_agg.groupby("batter")["batter_sr"].transform(lambda x: x.shift(1).rolling(PLAYER_WINDOW, min_periods=1).mean())
+bowl_agg["rolling_avg_wkt"]  = bowl_agg.groupby("bowler")["bowler_wickets"].transform(lambda x: x.shift(1).rolling(PLAYER_WINDOW, min_periods=1).mean())
+bowl_agg["rolling_avg_econ"] = bowl_agg.groupby("bowler")["bowler_economy"].transform(lambda x: x.shift(1).rolling(PLAYER_WINDOW, min_periods=1).mean())
 
-print(f"  Batting stats rows : {len(batting_stats)}")
-print(f"  Bowling stats rows : {len(bowling_stats)}")
+bat_dict = bat_agg.groupby("match_id").apply(lambda g: g[["batter","batting_team","rolling_avg_runs","rolling_avg_sr"]].to_dict("records")).to_dict()
+bowl_dict = bowl_agg.groupby("match_id").apply(lambda g: g[["bowler","bowling_team","rolling_avg_wkt","rolling_avg_econ"]].to_dict("records")).to_dict()
 
-print("\n" + "=" * 60)
-print("STEP 4: Detecting home venues from data")
-print("=" * 60)
+# Exact playing XIs
+pl_bat = raw.groupby(["match_id", "batting_team"])["batter"].unique().to_dict()
+pl_bowl = raw.groupby(["match_id", "bowling_team"])["bowler"].unique().to_dict()
 
-all_team_venue = pd.concat([
-    df[['team1', 'venue']].rename(columns={'team1': 'team'}),
-    df[['team2', 'venue']].rename(columns={'team2': 'team'}),
-])
-venue_counts     = all_team_venue.groupby(['team', 'venue']).size().reset_index(name='count')
-home_venues_df   = venue_counts.loc[venue_counts.groupby('team')['count'].idxmax()][['team', 'venue']]
-home_venue_map   = dict(zip(home_venues_df['team'], home_venues_df['venue']))
+print("STEP 3: Team & Venue stats")
+batting_stats = raw.groupby(["match_id","batting_team"]).agg(runs_scored=("runs_total","sum"), balls_faced=("valid_ball","sum")).reset_index().rename(columns={"match_id":"id"})
+all_tv = pd.concat([match_df[["team1","venue"]].rename(columns={"team1":"team"}), match_df[["team2","venue"]].rename(columns={"team2":"team"})])
+vc = all_tv.groupby(["team","venue"]).size().reset_index(name="count")
+home_venue_map = dict(zip(vc.loc[vc.groupby("team")["count"].idxmax()]["team"], vc.loc[vc.groupby("team")["count"].idxmax()]["venue"]))
 
-for team, venue in sorted(home_venue_map.items()):
-    print(f"  {team:36s} : {venue}")
-
-print("\n" + "=" * 60)
-print("STEP 5: Computing rolling features (leak-free)")
-print("=" * 60)
-start_time = time.time()
-
-
-def team_wins_in(filtered_df, team):
-    """Count wins for `team` in the given filtered match dataframe."""
-    return (filtered_df['winner'] == team).sum()
-
-
-def get_rolling_batting(bat_df, match_ids, team, window):
-    """Average runs scored and run rate over last `window` batting innings."""
-    team_bat = bat_df[
-        bat_df['match_id'].isin(match_ids) & (bat_df['batting_team'] == team)
-    ].tail(window)
-    if len(team_bat) == 0:
-        return 0.0, 0.0
-    return team_bat['runs_scored'].mean(), team_bat['run_rate'].mean()
-
-
-def get_rolling_bowling(bowl_df, match_ids, team, window):
-    """Average wickets taken over last `window` bowling innings."""
-    team_bowl = bowl_df[
-        bowl_df['match_id'].isin(match_ids) & (bowl_df['bowling_team'] == team)
-    ].tail(window)
-    if len(team_bowl) == 0:
-        return 0.0
-    return team_bowl['wickets_taken'].mean()
-
+print("STEP 4: Computing advanced features")
+df = match_df.copy()
+elo = {t: float(ELO_INIT) for t in pd.concat([df["team1"],df["team2"]]).unique()}
 
 features_rows = []
-
 for idx in range(len(df)):
-    row   = df.iloc[idx]
-    team1 = row['team1']
-    team2 = row['team2']
-    venue = row['venue']
+    row = df.iloc[idx]; team1 = row["team1"]; team2 = row["team2"]; venue = row["venue"]; mid = row["id"]; past = df.iloc[:idx]
+    
+    t1_elo = elo[team1]; t2_elo = elo[team2]; elo_diff = t1_elo - t2_elo
+    t1_all = past[(past["team1"]==team1)|(past["team2"]==team1)]; t2_all = past[(past["team1"]==team2)|(past["team2"]==team2)]
+    t1_wr = (t1_all["winner"]==team1).sum()/len(t1_all) if len(t1_all) else 0.5
+    t2_wr = (t2_all["winner"]==team2).sum()/len(t2_all) if len(t2_all) else 0.5
+    
+    v_past = past[past["venue"]==venue]
+    t1_v = v_past[(v_past["team1"]==team1)|(v_past["team2"]==team1)]
+    t1_venue_wr = (t1_v["winner"]==team1).sum()/len(t1_v) if len(t1_v) else t1_wr
+    
+    n1 = max(len(t1_all.tail(FORM_WINDOW)),1); n2 = max(len(t2_all.tail(FORM_WINDOW)),1)
+    t1_form = (t1_all.tail(FORM_WINDOW)["winner"]==team1).sum()/n1 if len(t1_all) else 0.5
+    t2_form = (t2_all.tail(FORM_WINDOW)["winner"]==team2).sum()/n2 if len(t2_all) else 0.5
+    is_home_t1 = 1 if home_venue_map.get(team1)==venue else 0
+    
+    # NEW: Toss Synergy
+    v_bat_wr = 0.5
+    if len(v_past):
+        v_bat_wins = v_past[v_past["toss_decision"]=="bat"]
+        v_bat_wr = (v_bat_wins["winner"] == v_bat_wins["toss_winner"]).mean() if len(v_bat_wins) else 0.5
+    
+    toss_decision_bat = row["toss_decision_bat"]
+    is_optimal_toss = 1 if (v_bat_wr > 0.55 and toss_decision_bat) or (v_bat_wr < 0.45 and not toss_decision_bat) else 0
+    
+    venue_avg_score = batting_stats[batting_stats["id"].isin(set(v_past["id"]))]["runs_scored"].mean() if len(v_past) else 165.0
+    
+    # NEW: True Playing XI
+    def get_xi_features(team, exact_batters, exact_bowlers):
+        # We need historical stats for THESE exact players up to this point
+        b_runs = []; b_sr = []; bw_wkt = []; bw_econ = []
+        for b in exact_batters:
+            p_past = bat_agg[(bat_agg["batter"]==b) & (bat_agg["date"] < row["date"])]
+            if len(p_past): b_runs.append(p_past["batter_runs"].mean()); b_sr.append(p_past["batter_sr"].mean())
+        for b in exact_bowlers:
+            p_past = bowl_agg[(bowl_agg["bowler"]==b) & (bowl_agg["date"] < row["date"])]
+            if len(p_past): bw_wkt.append(p_past["bowler_wickets"].mean()); bw_econ.append(p_past["bowler_economy"].mean())
+        
+        return (np.mean(b_runs) if b_runs else 20.0, np.mean(b_sr) if b_sr else 120.0,
+                np.mean(bw_wkt) if bw_wkt else 1.0, np.mean(bw_econ) if bw_econ else 8.0)
 
-    past = df.iloc[:idx]
+    # Get exact players for this match
+    t1_xi_bat = pl_bat.get((mid, team1), [])
+    t1_xi_bowl = pl_bowl.get((mid, team1), [])
+    t2_xi_bat = pl_bat.get((mid, team2), [])
+    t2_xi_bowl = pl_bowl.get((mid, team2), [])
 
-    t1_all = past[(past['team1'] == team1) | (past['team2'] == team1)]
-    t1_overall_wr = team_wins_in(t1_all, team1) / len(t1_all) if len(t1_all) else 0.5
-
-    t2_all = past[(past['team1'] == team2) | (past['team2'] == team2)]
-    t2_overall_wr = team_wins_in(t2_all, team2) / len(t2_all) if len(t2_all) else 0.5
-
-    h2h = past[
-        ((past['team1'] == team1) & (past['team2'] == team2)) |
-        ((past['team1'] == team2) & (past['team2'] == team1))
-    ]
-    h2h_wr = team_wins_in(h2h, team1) / len(h2h) if len(h2h) else 0.5
-
-    t1_venue = past[
-        ((past['team1'] == team1) | (past['team2'] == team1)) &
-        (past['venue'] == venue)
-    ]
-    t1_venue_wr = team_wins_in(t1_venue, team1) / len(t1_venue) if len(t1_venue) else t1_overall_wr
-
-    t1_recent = t1_all.tail(FORM_WINDOW)
-    t1_form = team_wins_in(t1_recent, team1) / len(t1_recent) if len(t1_recent) else 0.5
-
-    t2_recent = t2_all.tail(FORM_WINDOW)
-    t2_form = team_wins_in(t2_recent, team2) / len(t2_recent) if len(t2_recent) else 0.5
-
-    is_home_t1 = 1 if home_venue_map.get(team1) == venue else 0
-    is_home_t2 = 1 if home_venue_map.get(team2) == venue else 0
-
-    t1_past_ids = set(t1_all['id'])
-    t2_past_ids = set(t2_all['id'])
-
-    t1_avg_runs, t1_avg_rr = get_rolling_batting(batting_stats, t1_past_ids, team1, STATS_WINDOW)
-    t1_avg_wkt             = get_rolling_bowling(bowling_stats, t1_past_ids, team1, STATS_WINDOW)
-
-    t2_avg_runs, t2_avg_rr = get_rolling_batting(batting_stats, t2_past_ids, team2, STATS_WINDOW)
-    t2_avg_wkt             = get_rolling_bowling(bowling_stats, t2_past_ids, team2, STATS_WINDOW)
-
+    t1_xi_ba, t1_xi_bs, t1_xi_bw, t1_xi_be = get_xi_features(team1, t1_xi_bat, t1_xi_bowl)
+    t2_xi_ba, t2_xi_bs, t2_xi_bw, t2_xi_be = get_xi_features(team2, t2_xi_bat, t2_xi_bowl)
+    
     features_rows.append({
-        'team1_overall_wr' : t1_overall_wr,
-        'team2_overall_wr' : t2_overall_wr,
-        'h2h_win_rate'     : h2h_wr,
-        'team1_venue_wr'   : t1_venue_wr,
-        'team1_form'       : t1_form,
-        'team2_form'       : t2_form,
-        'is_home_team1'    : is_home_t1,
-        'is_home_team2'    : is_home_t2,
-        'team1_avg_runs'   : t1_avg_runs,
-        'team1_avg_rr'     : t1_avg_rr,
-        'team1_avg_wkt'    : t1_avg_wkt,
-        'team2_avg_runs'   : t2_avg_runs,
-        'team2_avg_rr'     : t2_avg_rr,
-        'team2_avg_wkt'    : t2_avg_wkt,
+        "target_score": row["target_score"], "target_wickets": row["target_wickets"], 
+        "target_vs_venue_avg": row["target_score"] - venue_avg_score,
+        "toss_winner_is_team1": row["toss_winner_is_team1"], "toss_decision_bat": toss_decision_bat,
+        "is_optimal_toss": is_optimal_toss, "venue_bat_wr": v_bat_wr,
+        "elo_diff": elo_diff, "team1_overall_wr": t1_wr, "team2_overall_wr": t2_wr,
+        "team1_venue_wr": t1_venue_wr, "team1_form": t1_form, "team2_form": t2_form,
+        "is_home_team1": is_home_t1, "venue_avg_score": venue_avg_score,
+        "t1_xi_bat_avg": t1_xi_ba, "t1_xi_bat_sr": t1_xi_bs, "t1_xi_bowl_wkt": t1_xi_bw, "t1_xi_bowl_econ": t1_xi_be,
+        "t2_xi_bat_avg": t2_xi_ba, "t2_xi_bat_sr": t2_xi_bs, "t2_xi_bowl_wkt": t2_xi_bw, "t2_xi_bowl_econ": t2_xi_be,
     })
+    
+    # Margin-Adjusted ELO
+    outcome = row["team1_won"]
+    win_out = str(row.get("win_outcome", ""))
+    M = 1.0
+    if "runs" in win_out:
+        try:
+            r = int(win_out.split(" ")[0])
+            M = 2.0 if r > 50 else (1.5 if r > 20 else 1.0)
+        except: pass
+    elif "wickets" in win_out:
+        try:
+            w = int(win_out.split(" ")[0])
+            M = 2.0 if w >= 8 else (1.5 if w >= 5 else 1.0)
+        except: pass
 
-    if (idx + 1) % 250 == 0:
-        print(f"  Processed {idx + 1}/{len(df)} matches...")
+    e1 = 1.0 / (1.0 + 10.0 ** ((t2_elo - t1_elo)/400.0))
+    elo[team1] = t1_elo + ELO_K * M * (outcome - e1)
+    elo[team2] = t2_elo + ELO_K * M * ((1-outcome)-(1-e1))
 
-features_df = pd.DataFrame(features_rows)
-for col in features_df.columns:
-    df[col] = features_df[col].values
+features_df = pd.DataFrame(features_rows).fillna(0)
+for col in features_df.columns: df[col] = features_df[col].values
 
-elapsed = time.time() - start_time
-print(f"  Done - {len(features_df.columns)} rolling features in {elapsed:.1f}s")
+# Features split
+INPLAY_FEATURES = ['target_score', 'target_wickets', 'target_vs_venue_avg', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score', 'is_optimal_toss', 'venue_bat_wr']
 
+PREMATCH_FEATURES = ['toss_winner_is_team1', 'toss_decision_bat', 'is_optimal_toss', 'venue_bat_wr', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score']
 
-print("\n" + "=" * 60)
-print("STEP 6: Label-encoding teams & venues")
-print("=" * 60)
+y = df["team1_won"]
+train_mask = df["date"].dt.year < 2023; test_mask = df["date"].dt.year >= 2023
+y_train, y_test = y[train_mask], y[test_mask]
+pos_w = float((y_train==0).sum()) / float((y_train==1).sum())
 
-le_team  = LabelEncoder()
-le_venue = LabelEncoder()
+def build_stacking_model(X_tr, X_te):
+    xgb = XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.05, scale_pos_weight=pos_w, random_state=42)
+    rf = RandomForestClassifier(n_estimators=300, max_depth=8, class_weight="balanced", random_state=42)
+    mlp = Pipeline([("sc", StandardScaler()), ("mlp", MLPClassifier(hidden_layer_sizes=(128,64), max_iter=500, random_state=42, early_stopping=True))])
+    stack = StackingClassifier(estimators=[("xgb",xgb), ("rf",rf), ("mlp",mlp)], final_estimator=LogisticRegression(class_weight="balanced"), cv=5, n_jobs=-1)
+    stack.fit(X_tr, y_train)
+    return stack, accuracy_score(y_test, stack.predict(X_te))
 
-all_teams = pd.concat([df['team1'], df['team2']]).unique()
-le_team.fit(all_teams)
-le_venue.fit(df['venue'])
+print("STEP 5: Training PRE-MATCH Model (with True XI, Toss Synergy & Margin ELO)")
+X_pre = df[PREMATCH_FEATURES].copy()
+prematch_model, pre_acc = build_stacking_model(X_pre[train_mask], X_pre[test_mask])
+print(f"  Pre-Match Model Acc: {pre_acc*100:.2f}%")
 
-def safe_transform(le, series):
-    known = set(le.classes_)
-    return series.apply(lambda x: le.transform([x])[0] if x in known else -1)
-
-df['team1_enc'] = safe_transform(le_team,  df['team1'])
-df['team2_enc'] = safe_transform(le_team,  df['team2'])
-df['venue_enc'] = safe_transform(le_venue, df['venue'])
-
-print(f"  Teams : {len(le_team.classes_)}")
-print(f"  Venues: {len(le_venue.classes_)}")
-
-
-print("\n" + "=" * 60)
-print("STEP 7: Feature matrix & time-based train/test split")
-print("=" * 60)
-
-FEATURES = [
-    'team1_enc', 'team2_enc', 'venue_enc',
-    'toss_winner_is_team1', 'toss_decision_bat',
-    'team1_overall_wr', 'team2_overall_wr',
-    'h2h_win_rate', 'team1_venue_wr',
-    'team1_form', 'team2_form',
-    'is_home_team1', 'is_home_team2',
-    'team1_avg_runs', 'team1_avg_rr', 'team1_avg_wkt',
-    'team2_avg_runs', 'team2_avg_rr', 'team2_avg_wkt',
-]
-
-X = df[FEATURES].copy().fillna(0.5)
-y = df['team1_won']
-
-
-split_idx = int(len(df) * 0.80)
-X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-print(f"  Total features: {len(FEATURES)}")
-print(f"  Training      : {len(X_train)} matches (up to {df['date'].iloc[split_idx - 1].date()})")
-print(f"  Testing       : {len(X_test)} matches (from {df['date'].iloc[split_idx].date()})")
-print(f"  Train win rate: {y_train.mean()*100:.1f}%")
-print(f"  Test  win rate: {y_test.mean()*100:.1f}%")
-
-print("\n" + "=" * 60)
-print("STEP 8: Training multiple models + ensemble")
-print("=" * 60)
-tune_start = time.time()
-
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-
-print("\n  [A] Tuning XGBoost...")
-xgb_param_grid = {
-    'n_estimators'    : [100, 200, 400],
-    'max_depth'       : [2, 3, 4],
-    'learning_rate'   : [0.01, 0.05, 0.1],
-    'subsample'       : [0.7, 0.8],
-    'colsample_bytree': [0.7, 0.8],
-    'min_child_weight': [1, 3, 5],
-}
-
-tscv = TimeSeriesSplit(n_splits=5)
-xgb_grid = GridSearchCV(
-    XGBClassifier(eval_metric='logloss', random_state=RANDOM_STATE, verbosity=0),
-    xgb_param_grid,
-    cv=tscv,
-    scoring='accuracy',
-    n_jobs=-1,
-    verbose=0,
-)
-xgb_grid.fit(X_train, y_train)
-xgb_model = xgb_grid.best_estimator_
-xgb_acc = accuracy_score(y_test, xgb_model.predict(X_test))
-print(f"      Best CV: {xgb_grid.best_score_*100:.2f}%  |  Test: {xgb_acc*100:.2f}%")
-print(f"      Params: {xgb_grid.best_params_}")
-
-print("\n  [B] Tuning Random Forest...")
-rf_param_grid = {
-    'n_estimators': [100, 200, 400],
-    'max_depth': [3, 5, 8, None],
-    'min_samples_split': [2, 5, 10],
-    'min_samples_leaf': [1, 2, 4],
-}
-rf_grid = GridSearchCV(
-    RandomForestClassifier(random_state=RANDOM_STATE),
-    rf_param_grid,
-    cv=tscv,
-    scoring='accuracy',
-    n_jobs=-1,
-    verbose=0,
-)
-rf_grid.fit(X_train, y_train)
-rf_model = rf_grid.best_estimator_
-rf_acc = accuracy_score(y_test, rf_model.predict(X_test))
-print(f"      Best CV: {rf_grid.best_score_*100:.2f}%  |  Test: {rf_acc*100:.2f}%")
-
-
-print("\n  [C] Training Logistic Regression...")
-lr_pipe = Pipeline([
-    ('scaler', StandardScaler()),
-    ('lr', LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
-])
-lr_param_grid = {'lr__C': [0.01, 0.1, 1, 10]}
-lr_grid = GridSearchCV(lr_pipe, lr_param_grid, cv=tscv, scoring='accuracy', n_jobs=-1, verbose=0)
-lr_grid.fit(X_train, y_train)
-lr_model = lr_grid.best_estimator_
-lr_acc = accuracy_score(y_test, lr_model.predict(X_test))
-print(f"      Best CV: {lr_grid.best_score_*100:.2f}%  |  Test: {lr_acc*100:.2f}%")
-
-
-print("\n  [D] Tuning Gradient Boosting...")
-gb_param_grid = {
-    'n_estimators': [100, 200],
-    'max_depth': [2, 3, 4],
-    'learning_rate': [0.01, 0.05, 0.1],
-    'subsample': [0.7, 0.8],
-}
-gb_grid = GridSearchCV(
-    GradientBoostingClassifier(random_state=RANDOM_STATE),
-    gb_param_grid,
-    cv=tscv,
-    scoring='accuracy',
-    n_jobs=-1,
-    verbose=0,
-)
-gb_grid.fit(X_train, y_train)
-gb_model = gb_grid.best_estimator_
-gb_acc = accuracy_score(y_test, gb_model.predict(X_test))
-print(f"      Best CV: {gb_grid.best_score_*100:.2f}%  |  Test: {gb_acc*100:.2f}%")
-
-
-print("\n  [E] Building Voting Ensemble...")
-ensemble = VotingClassifier(
-    estimators=[
-        ('xgb', xgb_model),
-        ('rf', rf_model),
-        ('lr', lr_model),
-        ('gb', gb_model),
-    ],
-    voting='soft',
-)
-ensemble.fit(X_train, y_train)
-ens_acc = accuracy_score(y_test, ensemble.predict(X_test))
-print(f"      Ensemble Test Accuracy: {ens_acc*100:.2f}%")
-
-tune_elapsed = time.time() - tune_start
-print(f"\n  Total tuning time: {tune_elapsed:.1f}s")
-
-results = {
-    'XGBoost': (xgb_model, xgb_acc),
-    'RandomForest': (rf_model, rf_acc),
-    'LogisticRegression': (lr_model, lr_acc),
-    'GradientBoosting': (gb_model, gb_acc),
-    'Ensemble': (ensemble, ens_acc),
-}
-
-print("\n  Model comparison:")
-for name, (mdl, acc) in sorted(results.items(), key=lambda x: -x[1][1]):
-    marker = " <-- BEST" if acc == max(v[1] for v in results.values()) else ""
-    print(f"    {name:24s}  {acc*100:.2f}%{marker}")
-
-best_name = max(results, key=lambda k: results[k][1])
-model = results[best_name][0]
-best_acc = results[best_name][1]
-print(f"\n  >> Selected: {best_name} ({best_acc*100:.2f}%)")
-print("\n" + "=" * 60)
-print("STEP 9: Final evaluation")
-print("=" * 60)
-
-preds = model.predict(X_test)
-acc   = accuracy_score(y_test, preds)
-
-print(f"\n  >> Test Accuracy: {acc*100:.2f}%\n")
-print(classification_report(y_test, preds, target_names=['Team2 wins', 'Team1 wins']))
-
-
-if hasattr(model, 'feature_importances_'):
-    feat_imp = pd.Series(model.feature_importances_, index=FEATURES).sort_values(ascending=False)
-    print("  Feature importance:")
-    for fname, fimp in feat_imp.items():
-        bar = '#' * int(fimp * 40)
-        print(f"    {fname:24s} {fimp:.4f}  {bar}")
-
-print("\n" + "=" * 60)
-print("STEP 10: Saving artifacts to models/")
-print("=" * 60)
+print("STEP 6: Training IN-PLAY Model")
+X_inp = df[INPLAY_FEATURES].copy()
+inplay_model, inp_acc = build_stacking_model(X_inp[train_mask], X_inp[test_mask])
+print(f"  In-Play Model Acc: {inp_acc*100:.2f}%")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+with open(os.path.join(MODEL_DIR, "prematch_model.pkl"), "wb") as f: pickle.dump(prematch_model, f)
+with open(os.path.join(MODEL_DIR, "prematch_features.pkl"), "wb") as f: pickle.dump(PREMATCH_FEATURES, f)
+with open(os.path.join(MODEL_DIR, "inplay_model.pkl"), "wb") as f: pickle.dump(inplay_model, f)
+with open(os.path.join(MODEL_DIR, "inplay_features.pkl"), "wb") as f: pickle.dump(INPLAY_FEATURES, f)
 
-artifacts = {
-    'win_model.pkl'    : model,
-    'features.pkl'     : FEATURES,
-    'le_team.pkl'      : le_team,
-    'le_venue.pkl'     : le_venue,
-    'teams_list.pkl'   : sorted(le_team.classes_.tolist()),
-    'venues_list.pkl'  : sorted(le_venue.classes_.tolist()),
-    'home_venues.pkl'  : home_venue_map,
-    'batting_stats.pkl': batting_stats,
-    'bowling_stats.pkl': bowling_stats,
-    'match_history.pkl': df[['id', 'date', 'team1', 'team2', 'venue', 'winner', 'team1_won']].copy(),
-}
+le_team = LabelEncoder(); le_venue = LabelEncoder()
+le_team.fit(pd.concat([df["team1"],df["team2"]]).unique()); le_venue.fit(df["venue"].unique())
+with open(os.path.join(MODEL_DIR, "teams_list.pkl"), "wb") as f: pickle.dump(sorted(le_team.classes_.tolist()), f)
+with open(os.path.join(MODEL_DIR, "venues_list.pkl"), "wb") as f: pickle.dump(sorted(le_venue.classes_.tolist()), f)
+with open(os.path.join(MODEL_DIR, "match_history.pkl"), "wb") as f: pickle.dump(df, f)
+with open(os.path.join(MODEL_DIR, "batting_stats.pkl"), "wb") as f: pickle.dump(batting_stats, f)
+with open(os.path.join(MODEL_DIR, "home_venues.pkl"), "wb") as f: pickle.dump(home_venue_map, f)
+with open(os.path.join(MODEL_DIR, "elo_ratings.pkl"), "wb") as f: pickle.dump(elo, f)
 
-for filename, obj in artifacts.items():
-    path = os.path.join(MODEL_DIR, filename)
-    with open(path, 'wb') as f:
-        pickle.dump(obj, f)
-    print(f"  [OK] {filename}")
+latest_bat  = bat_agg.sort_values("date").groupby("batter").last()[["rolling_avg_runs","rolling_avg_sr","batting_team"]].reset_index()
+latest_bowl = bowl_agg.sort_values("date").groupby("bowler").last()[["rolling_avg_wkt","rolling_avg_econ","bowling_team"]].reset_index()
 
-print("\n" + "=" * 60)
-print("TRAINING COMPLETE")
-print("=" * 60)
+# For app UI, group players by team so users can select their True XI
+squads_bat = raw.groupby("batting_team")["batter"].unique().to_dict()
+squads_bowl = raw.groupby("bowling_team")["bowler"].unique().to_dict()
+
+with open(os.path.join(MODEL_DIR, "latest_bat_stats.pkl"), "wb") as f: pickle.dump(latest_bat, f)
+with open(os.path.join(MODEL_DIR, "latest_bowl_stats.pkl"), "wb") as f: pickle.dump(latest_bowl, f)
+with open(os.path.join(MODEL_DIR, "team_squad_bat.pkl"), "wb") as f: pickle.dump(squads_bat, f)
+with open(os.path.join(MODEL_DIR, "team_squad_bowl.pkl"), "wb") as f: pickle.dump(squads_bowl, f)
+
+print("ALL DONE!")

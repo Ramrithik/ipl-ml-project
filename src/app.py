@@ -1,198 +1,159 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import pickle
 import os
 
-MODEL_DIR    = os.path.join(os.path.dirname(__file__), '..', 'models')
-FORM_WINDOW  = 5
-STATS_WINDOW = 10
+MODEL_DIR     = os.path.join(os.path.dirname(__file__), '..', 'models')
+FORM_WINDOW   = 5
+STATS_WINDOW  = 10
 
 @st.cache_resource
 def load_artifacts():
-    def _load(name):
-        with open(os.path.join(MODEL_DIR, name), 'rb') as f:
-            return pickle.load(f)
-
+    def _l(name):
+        with open(os.path.join(MODEL_DIR, name), 'rb') as f: return pickle.load(f)
     return (
-        _load('win_model.pkl'),
-        _load('le_team.pkl'),
-        _load('le_venue.pkl'),
-        _load('teams_list.pkl'),
-        _load('venues_list.pkl'),
-        _load('features.pkl'),
-        _load('match_history.pkl'),
-        _load('batting_stats.pkl'),
-        _load('bowling_stats.pkl'),
-        _load('home_venues.pkl'),
+        _l('prematch_model.pkl'), _l('prematch_features.pkl'),
+        _l('inplay_model.pkl'), _l('inplay_features.pkl'),
+        _l('teams_list.pkl'), _l('venues_list.pkl'),
+        _l('match_history.pkl'), _l('batting_stats.pkl'),
+        _l('home_venues.pkl'), _l('elo_ratings.pkl'),
+        _l('latest_bat_stats.pkl'), _l('latest_bowl_stats.pkl'),
+        _l('team_squad_bat.pkl'), _l('team_squad_bowl.pkl')
     )
 
+(prematch_model, PREMATCH_FEATURES, inplay_model, INPLAY_FEATURES, TEAMS, VENUES,
+ HISTORY, BATTING_STATS, HOME_VENUES, ELO,
+ LATEST_BAT, LATEST_BOWL, SQUAD_BAT, SQUAD_BOWL) = load_artifacts()
 
-(
-    model, le_team, le_venue,
-    TEAMS, VENUES, FEATURES,
-    HISTORY, BATTING_STATS, BOWLING_STATS, HOME_VENUES,
-) = load_artifacts()
+def compute_features(team1, team2, venue, t1_xi, t2_xi, toss_winner=None, toss_decision=None, target_score=None, target_wickets=None):
+    hist = HISTORY
+    t1e  = ELO.get(team1, 1500.0);  t2e = ELO.get(team2, 1500.0)
+    elo_diff = t1e - t2e
 
-def compute_features(team1, team2, venue, toss_winner, toss_decision):
-    """
-    Build the feature vector for a new match using REAL historical stats
-    instead of hard-coded 0.5 placeholders.
-    """
+    t1a = hist[(hist['team1'] == team1) | (hist['team2'] == team1)]
+    t2a = hist[(hist['team1'] == team2) | (hist['team2'] == team2)]
+    t1_wr = (t1a['winner'] == team1).sum() / len(t1a) if len(t1a) else 0.5
+    t2_wr = (t2a['winner'] == team2).sum() / len(t2a) if len(t2a) else 0.5
 
-    t1_enc = le_team.transform([team1])[0]
-    t2_enc = le_team.transform([team2])[0]
-    v_enc  = le_venue.transform([venue])[0]
+    t1v = hist[((hist['team1'] == team1) | (hist['team2'] == team1)) & (hist['venue'] == venue)]
+    t1_venue_wr = (t1v['winner'] == team1).sum() / len(t1v) if len(t1v) else t1_wr
 
-    toss_is_t1 = 1 if toss_winner   == team1 else 0
-    toss_bat   = 1 if toss_decision == 'bat' else 0
-
-    hist = HISTORY  
-
-    
-    t1_all = hist[(hist['team1'] == team1) | (hist['team2'] == team1)]
-    t1_wins = (t1_all['winner'] == team1).sum()
-    t1_overall_wr = t1_wins / len(t1_all) if len(t1_all) else 0.5
-
-    t2_all = hist[(hist['team1'] == team2) | (hist['team2'] == team2)]
-    t2_wins = (t2_all['winner'] == team2).sum()
-    t2_overall_wr = t2_wins / len(t2_all) if len(t2_all) else 0.5
-
-    
-    h2h = hist[
-        ((hist['team1'] == team1) & (hist['team2'] == team2)) |
-        ((hist['team1'] == team2) & (hist['team2'] == team1))
-    ]
-    h2h_t1_wins = (h2h['winner'] == team1).sum()
-    h2h_wr = h2h_t1_wins / len(h2h) if len(h2h) else 0.5
-    t1_venue = hist[
-        ((hist['team1'] == team1) | (hist['team2'] == team1)) &
-        (hist['venue'] == venue)
-    ]
-    t1_venue_wins = (t1_venue['winner'] == team1).sum()
-    t1_venue_wr = t1_venue_wins / len(t1_venue) if len(t1_venue) else t1_overall_wr
-
-    t1_recent = t1_all.tail(FORM_WINDOW)
-    t1_form = (t1_recent['winner'] == team1).sum() / len(t1_recent) if len(t1_recent) else 0.5
-
-    t2_recent = t2_all.tail(FORM_WINDOW)
-    t2_form = (t2_recent['winner'] == team2).sum() / len(t2_recent) if len(t2_recent) else 0.5
-
+    n1 = max(len(t1a.tail(FORM_WINDOW)), 1); n2 = max(len(t2a.tail(FORM_WINDOW)), 1)
+    t1_form = (t1a.tail(FORM_WINDOW)['winner'] == team1).sum() / n1
+    t2_form = (t2a.tail(FORM_WINDOW)['winner'] == team2).sum() / n2
     is_home_t1 = 1 if HOME_VENUES.get(team1) == venue else 0
-    is_home_t2 = 1 if HOME_VENUES.get(team2) == venue else 0
 
-    t1_past_ids = set(t1_all['id'])
-    t2_past_ids = set(t2_all['id'])
+    vp = hist[hist['venue'] == venue]
+    v_bat_wr = 0.5
+    if len(vp):
+        v_bat_wins = vp[vp["toss_decision"]=="bat"]
+        v_bat_wr = (v_bat_wins["winner"] == v_bat_wins["toss_winner"]).mean() if len(v_bat_wins) else 0.5
+        
+    v_ids = set(vp['id']) if len(vp) else set()
+    vb = BATTING_STATS[BATTING_STATS['id'].isin(v_ids)]
+    venue_avg_score = vb['runs_scored'].mean() if len(vb) else 165.0
 
-    def _batting_avg(team, ids):
-        rows = BATTING_STATS[
-            BATTING_STATS['match_id'].isin(ids) & (BATTING_STATS['batting_team'] == team)
-        ].tail(STATS_WINDOW)
-        if len(rows) == 0:
-            return 0.0, 0.0
-        return rows['runs_scored'].mean(), rows['run_rate'].mean()
+    def get_xi_agg(xi_list):
+        b_r = LATEST_BAT[LATEST_BAT["batter"].isin(xi_list)]
+        ba = b_r["rolling_avg_runs"].mean() if len(b_r) else 20.0
+        bs = b_r["rolling_avg_sr"].mean() if len(b_r) else 120.0
+        bw_r = LATEST_BOWL[LATEST_BOWL["bowler"].isin(xi_list)]
+        bw = bw_r["rolling_avg_wkt"].mean() if len(bw_r) else 1.0
+        be = bw_r["rolling_avg_econ"].mean() if len(bw_r) else 8.0
+        return ba, bs, bw, be
 
-    def _bowling_avg(team, ids):
-        rows = BOWLING_STATS[
-            BOWLING_STATS['match_id'].isin(ids) & (BOWLING_STATS['bowling_team'] == team)
-        ].tail(STATS_WINDOW)
-        if len(rows) == 0:
-            return 0.0
-        return rows['wickets_taken'].mean()
+    t1_ba, t1_bs, t1_bw, t1_be = get_xi_agg(t1_xi)
+    t2_ba, t2_bs, t2_bw, t2_be = get_xi_agg(t2_xi)
 
-    t1_avg_runs, t1_avg_rr = _batting_avg(team1, t1_past_ids)
-    t1_avg_wkt             = _bowling_avg(team1, t1_past_ids)
-    t2_avg_runs, t2_avg_rr = _batting_avg(team2, t2_past_ids)
-    t2_avg_wkt             = _bowling_avg(team2, t2_past_ids)
-    sample = pd.DataFrame([[
-        t1_enc, t2_enc, v_enc,
-        toss_is_t1, toss_bat,
-        t1_overall_wr, t2_overall_wr,
-        h2h_wr, t1_venue_wr,
-        t1_form, t2_form,
-        is_home_t1, is_home_t2,
-        t1_avg_runs, t1_avg_rr, t1_avg_wkt,
-        t2_avg_runs, t2_avg_rr, t2_avg_wkt,
-    ]], columns=FEATURES)
-
-    stats_display = {
-        'team1_overall_wr' : t1_overall_wr,
-        'team2_overall_wr' : t2_overall_wr,
-        'h2h_win_rate'     : h2h_wr,
-        'team1_venue_wr'   : t1_venue_wr,
-        'team1_form'       : t1_form,
-        'team2_form'       : t2_form,
-        'is_home_team1'    : bool(is_home_t1),
-        'is_home_team2'    : bool(is_home_t2),
-        'h2h_total'        : len(h2h),
-        't1_avg_runs'      : t1_avg_runs,
-        't2_avg_runs'      : t2_avg_runs,
+    vals = {
+        'elo_diff': elo_diff, 'team1_overall_wr': t1_wr, 'team2_overall_wr': t2_wr,
+        'team1_venue_wr': t1_venue_wr, 'team1_form': t1_form, 'team2_form': t2_form,
+        'is_home_team1': is_home_t1, 'venue_bat_wr': v_bat_wr, 'venue_avg_score': venue_avg_score,
+        't1_xi_bat_avg': t1_ba, 't1_xi_bat_sr': t1_bs, 't1_xi_bowl_wkt': t1_bw, 't1_xi_bowl_econ': t1_be,
+        't2_xi_bat_avg': t2_ba, 't2_xi_bat_sr': t2_bs, 't2_xi_bowl_wkt': t2_bw, 't2_xi_bowl_econ': t2_be,
     }
 
-    return sample, stats_display
+    if target_score is not None:
+        vals['target_score'] = target_score
+        vals['target_wickets'] = target_wickets
+        vals['target_vs_venue_avg'] = target_score - venue_avg_score
+        sample = pd.DataFrame([[vals.get(f, 0.0) for f in INPLAY_FEATURES]], columns=INPLAY_FEATURES)
+    else:
+        toss_decision_bat = 1 if toss_decision == 'bat' else 0
+        vals['toss_winner_is_team1'] = 1 if toss_winner == team1 else 0
+        vals['toss_decision_bat'] = toss_decision_bat
+        vals['is_optimal_toss'] = 1 if (v_bat_wr > 0.55 and toss_decision_bat) or (v_bat_wr < 0.45 and not toss_decision_bat) else 0
+        sample = pd.DataFrame([[vals.get(f, 0.0) for f in PREMATCH_FEATURES]], columns=PREMATCH_FEATURES)
 
-st.set_page_config(page_title='IPL Win Predictor', page_icon='🏏', layout='centered')
-st.title('🏏 IPL Win Probability Predictor')
-st.caption('Powered by XGBoost · Rolling stats · Home advantage · Recent form · IPL 2008–2024')
-st.divider()
+    stats = {'t1_elo': t1e, 't2_elo': t2e, 'venue_avg_score': venue_avg_score, 'v_bat_wr': v_bat_wr}
+    return sample, stats
 
-col1, col2 = st.columns(2)
-with col1:
-    team1 = st.selectbox('Team 1', TEAMS)
-with col2:
-    team2 = st.selectbox('Team 2', [t for t in TEAMS if t != team1])
+st.set_page_config(page_title='Dual IPL Predictor', page_icon='🏏', layout='wide')
+import ui_styles
+st.title('🏏 Ultimate Dual IPL Predictor')
+st.caption('Contains both True XI Pre-Match Model and In-Play Model.')
 
-venue = st.selectbox('Venue', VENUES)
+st.sidebar.header("📋 True Playing XI Selector")
+t1_squad = list(set(SQUAD_BAT.get("Chennai Super Kings", [])))
+t1_squad.extend(SQUAD_BOWL.get("Chennai Super Kings", []))
+t1_squad = sorted(list(set(t1_squad)))
 
-col3, col4 = st.columns(2)
-with col3:
-    toss_winner   = st.selectbox('Toss winner', [team1, team2])
-with col4:
-    toss_decision = st.selectbox('Toss decision', ['bat', 'field'])
+t1 = st.sidebar.selectbox('Team 1', TEAMS, index=TEAMS.index("Chennai Super Kings") if "Chennai Super Kings" in TEAMS else 0)
+t2 = st.sidebar.selectbox('Team 2', [t for t in TEAMS if t != t1])
 
-st.divider()
+def get_squad(team):
+    sq = list(set(SQUAD_BAT.get(team, [])))
+    sq.extend(SQUAD_BOWL.get(team, []))
+    return sorted(list(set(sq)))
 
-if st.button(' Predict Winner', use_container_width=True, type='primary'):
-    try:
-        sample, stats = compute_features(team1, team2, venue, toss_winner, toss_decision)
+t1_xi = st.sidebar.multiselect(f"{t1} Playing XI", get_squad(t1))
+t2_xi = st.sidebar.multiselect(f"{t2} Playing XI", get_squad(t2))
 
-        prob   = model.predict_proba(sample)[0]
-        t1_pct = round(prob[1] * 100, 1)
-        t2_pct = round(prob[0] * 100, 1)
-        winner = team1 if prob[1] > 0.5 else team2
+venue = st.sidebar.selectbox('Venue', VENUES)
 
-        st.success(f'🏆 Predicted winner: **{winner}**')
+tab1, tab2 = st.tabs(["🔮 Pre-Match Predictor", "🏃‍♂️ In-Play Predictor"])
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric(label=team1, value=f'{t1_pct}%')
-            st.progress(int(t1_pct))
-        with col_b:
-            st.metric(label=team2, value=f'{t2_pct}%')
-            st.progress(int(t2_pct))
-        st.divider()
-        st.subheader('Key Factors')
+with tab1:
+    st.subheader("Predict before the match starts")
+    c3, c4 = st.columns(2)
+    with c3: tw_pre = st.selectbox('Toss Winner', [t1, t2], key='tw_pre')
+    with c4: td_pre = st.selectbox('Decision', ['bat', 'field'], key='td_pre')
 
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            st.markdown(f"**{team1}**")
-            st.write(f"Overall Win Rate: {stats['team1_overall_wr']*100:.1f}%")
-            st.write(f"Recent Form (last {FORM_WINDOW}): {stats['team1_form']*100:.1f}%")
-            st.write(f"Venue Win Rate: {stats['team1_venue_wr']*100:.1f}%")
-            st.write(f"Avg Runs (last {STATS_WINDOW}): {stats['t1_avg_runs']:.1f}")
-            st.write(f"Home Advantage: {' Yes' if stats['is_home_team1'] else '❌ No'}")
+    if st.button('🔮 Predict Pre-Match', use_container_width=True, type='primary'):
+        sample, stats = compute_features(t1, t2, venue, t1_xi, t2_xi, toss_winner=tw_pre, toss_decision=td_pre)
+        proba = prematch_model.predict_proba(sample)[0]
+        winner = t1 if proba[1] > proba[0] else t2
+        st.success(f'🏆 Pre-Match Predicted Winner: **{winner}**')
+        ca, cb = st.columns(2)
+        with ca:
+            st.metric(f'🏏 {t1}', f'{proba[1]*100:.1f}%', delta=f'Elo {stats["t1_elo"]:.0f}')
+            st.progress(int(proba[1]*100))
+        with cb:
+            st.metric(f'🏏 {t2}', f'{proba[0]*100:.1f}%', delta=f'Elo {stats["t2_elo"]:.0f}')
+            st.progress(int(proba[0]*100))
 
-        with sc2:
-            st.markdown(f"**{team2}**")
-            st.write(f"Overall Win Rate: {stats['team2_overall_wr']*100:.1f}%")
-            st.write(f"Recent Form (last {FORM_WINDOW}): {stats['team2_form']*100:.1f}%")
-            st.write(f"Avg Runs (last {STATS_WINDOW}): {stats['t2_avg_runs']:.1f}")
-            st.write(f"Home Advantage: {' Yes' if stats['is_home_team2'] else '❌ No'}")
+with tab2:
+    st.subheader("Predict run chase after 1st innings")
+    vp = HISTORY[HISTORY['venue'] == venue]
+    v_bat_wr = 0.5
+    if len(vp):
+        v_bat_wins = vp[vp["toss_decision"]=="bat"]
+        v_bat_wr = (v_bat_wins["winner"] == v_bat_wins["toss_winner"]).mean() if len(v_bat_wins) else 0.5
+    st.info(f"Batting first win rate at {venue} is {v_bat_wr*100:.1f}%")
+    c3, c4 = st.columns(2)
+    with c3: score_inp = st.number_input('Target Score', min_value=0, max_value=300, value=170, step=1)
+    with c4: wkts_inp = st.number_input('Wickets Lost', min_value=0, max_value=10, value=6, step=1)
 
-        st.divider()
-        st.caption(
-            f"H2H record ({stats['h2h_total']} matches): "
-            f"{team1} wins {stats['h2h_win_rate']*100:.0f}% of encounters"
-        )
-
-    except Exception as e:
-        st.error(f'Prediction failed: {e}')
+    if st.button('🏃‍♂️ Predict Run Chase', use_container_width=True, type='primary'):
+        sample, stats = compute_features(t1, t2, venue, t1_xi, t2_xi, target_score=score_inp, target_wickets=wkts_inp)
+        proba = inplay_model.predict_proba(sample)[0]
+        winner = t1 if proba[1] > proba[0] else t2
+        st.success(f'🏆 In-Play Predicted Winner: **{winner}**')
+        ca, cb = st.columns(2)
+        with ca:
+            st.metric(f'🏏 {t1} (Defending)', f'{proba[1]*100:.1f}%', delta=f'Elo {stats["t1_elo"]:.0f}')
+            st.progress(int(proba[1]*100))
+        with cb:
+            st.metric(f'🏏 {t2} (Chasing)', f'{proba[0]*100:.1f}%', delta=f'Elo {stats["t2_elo"]:.0f}')
+            st.progress(int(proba[0]*100))
