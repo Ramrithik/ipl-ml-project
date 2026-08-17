@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 import numpy as np
 import pickle
 import os
@@ -130,10 +130,15 @@ for idx in range(len(df)):
         return (np.mean(b_runs) if b_runs else 20.0, np.mean(b_sr) if b_sr else 120.0,
                 np.mean(bw_wkt) if bw_wkt else 1.0, np.mean(bw_econ) if bw_econ else 8.0)
 
-    t1_xi_bat = pl_bat.get((mid, team1), [])
-    t1_xi_bowl = pl_bowl.get((mid, team1), [])
-    t2_xi_bat = pl_bat.get((mid, team2), [])
-    t2_xi_bowl = pl_bowl.get((mid, team2), [])
+    def get_probable_xi(team):
+        team_past = past[(past["team1"]==team) | (past["team2"]==team)]
+        if len(team_past) == 0:
+            return [], []
+        last_match_id = team_past.iloc[-1]["id"]
+        return pl_bat.get((last_match_id, team), []), pl_bowl.get((last_match_id, team), [])
+
+    t1_xi_bat, t1_xi_bowl = get_probable_xi(team1)
+    t2_xi_bat, t2_xi_bowl = get_probable_xi(team2)
 
     t1_xi_ba, t1_xi_bs, t1_xi_bw, t1_xi_be = get_xi_features(team1, t1_xi_bat, t1_xi_bowl)
     t2_xi_ba, t2_xi_bs, t2_xi_bw, t2_xi_be = get_xi_features(team2, t2_xi_bat, t2_xi_bowl)
