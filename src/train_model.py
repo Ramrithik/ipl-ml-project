@@ -76,7 +76,6 @@ bowl_agg["rolling_avg_econ"] = bowl_agg.groupby("bowler")["bowler_economy"].tran
 bat_dict = bat_agg.groupby("match_id").apply(lambda g: g[["batter","batting_team","rolling_avg_runs","rolling_avg_sr"]].to_dict("records")).to_dict()
 bowl_dict = bowl_agg.groupby("match_id").apply(lambda g: g[["bowler","bowling_team","rolling_avg_wkt","rolling_avg_econ"]].to_dict("records")).to_dict()
 
-# Exact playing XIs
 pl_bat = raw.groupby(["match_id", "batting_team"])["batter"].unique().to_dict()
 pl_bowl = raw.groupby(["match_id", "bowling_team"])["bowler"].unique().to_dict()
 
@@ -108,7 +107,6 @@ for idx in range(len(df)):
     t2_form = (t2_all.tail(FORM_WINDOW)["winner"]==team2).sum()/n2 if len(t2_all) else 0.5
     is_home_t1 = 1 if home_venue_map.get(team1)==venue else 0
     
-    # NEW: Toss Synergy
     v_bat_wr = 0.5
     if len(v_past):
         v_bat_wins = v_past[v_past["toss_decision"]=="bat"]
@@ -119,9 +117,7 @@ for idx in range(len(df)):
     
     venue_avg_score = batting_stats[batting_stats["id"].isin(set(v_past["id"]))]["runs_scored"].mean() if len(v_past) else 165.0
     
-    # NEW: True Playing XI
     def get_xi_features(team, exact_batters, exact_bowlers):
-        # We need historical stats for THESE exact players up to this point
         b_runs = []; b_sr = []; bw_wkt = []; bw_econ = []
         for b in exact_batters:
             p_past = bat_agg[(bat_agg["batter"]==b) & (bat_agg["date"] < row["date"])]
@@ -133,7 +129,6 @@ for idx in range(len(df)):
         return (np.mean(b_runs) if b_runs else 20.0, np.mean(b_sr) if b_sr else 120.0,
                 np.mean(bw_wkt) if bw_wkt else 1.0, np.mean(bw_econ) if bw_econ else 8.0)
 
-    # Get exact players for this match
     t1_xi_bat = pl_bat.get((mid, team1), [])
     t1_xi_bowl = pl_bowl.get((mid, team1), [])
     t2_xi_bat = pl_bat.get((mid, team2), [])
@@ -154,7 +149,6 @@ for idx in range(len(df)):
         "t2_xi_bat_avg": t2_xi_ba, "t2_xi_bat_sr": t2_xi_bs, "t2_xi_bowl_wkt": t2_xi_bw, "t2_xi_bowl_econ": t2_xi_be,
     })
     
-    # Margin-Adjusted ELO
     outcome = row["team1_won"]
     win_out = str(row.get("win_outcome", ""))
     M = 1.0
@@ -176,7 +170,6 @@ for idx in range(len(df)):
 features_df = pd.DataFrame(features_rows).fillna(0)
 for col in features_df.columns: df[col] = features_df[col].values
 
-# Features split
 INPLAY_FEATURES = ['target_score', 'target_wickets', 'target_vs_venue_avg', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score', 'is_optimal_toss', 'venue_bat_wr']
 
 PREMATCH_FEATURES = ['toss_winner_is_team1', 'toss_decision_bat', 'is_optimal_toss', 'venue_bat_wr', 'elo_diff', 'team1_overall_wr', 'team2_overall_wr', 'team1_venue_wr', 'team1_form', 'team2_form', 'is_home_team1', 't1_xi_bat_avg', 't1_xi_bat_sr', 't1_xi_bowl_wkt', 't1_xi_bowl_econ', 't2_xi_bat_avg', 't2_xi_bat_sr', 't2_xi_bowl_wkt', 't2_xi_bowl_econ', 'venue_avg_score']
@@ -222,7 +215,6 @@ with open(os.path.join(MODEL_DIR, "elo_ratings.pkl"), "wb") as f: pickle.dump(el
 latest_bat  = bat_agg.sort_values("date").groupby("batter").last()[["rolling_avg_runs","rolling_avg_sr","batting_team"]].reset_index()
 latest_bowl = bowl_agg.sort_values("date").groupby("bowler").last()[["rolling_avg_wkt","rolling_avg_econ","bowling_team"]].reset_index()
 
-# For app UI, group players by team so users can select their True XI
 squads_bat = raw.groupby("batting_team")["batter"].unique().to_dict()
 squads_bowl = raw.groupby("bowling_team")["bowler"].unique().to_dict()
 
