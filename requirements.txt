@@ -1,9 +1,5 @@
-pandas
-numpy
-scikit-learn
-xgboost
-matplotlib
-seaborn
-jupyter
-ipykernel
-streamlit
+numpy==2.2.4
+pandas==2.2.3
+scikit-learn==1.9.0
+streamlit==1.56.0
+xgboost==3.2.0
